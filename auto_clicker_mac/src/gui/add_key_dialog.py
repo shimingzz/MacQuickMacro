@@ -11,44 +11,62 @@ from pynput import keyboard as pynput_keyboard # Renamed to avoid conflict
 class KeyListenerThread(QThread):
     key_captured = Signal(object) # Can emit either str or pynput.keyboard.Key or None for error
 
+    key_captured = Signal(object)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.listener = None
-        self._stop_event = False
+        self.pynput_listener = None # Renamed to avoid confusion with QObject.listener
+        self._is_running = False # To control the loop
 
     def run(self):
-        self._stop_event = False
-        def on_press(key):
-            # Stop listening after the first key press
-            self.key_captured.emit(key)
-            return False # Stops the listener
+        print("[KeyListenerThread] Thread started")
+        self._is_running = True
 
-        # Create and start the listener in this thread
-        # self.listener = pynput_keyboard.Listener(on_press=on_press, suppress=True) # Suppress might be too aggressive
-        self.listener = pynput_keyboard.Listener(on_press=on_press)
-
-        # A small hack to ensure the listener runs correctly when started from a non-main thread
-        # or in environments where it might not pick up global events immediately.
-        # This is more relevant on some platforms/setups.
-        # For macOS, direct start should usually work if permissions are set.
         try:
-            self.listener.start()
-            self.listener.join() # Wait until listener stops (after one key)
+            def on_press_callback(key):
+                print(f"[KeyListenerThread] Key pressed: {key}")
+                if not self._is_running: # Check if we should still process
+                    return False
+                self.key_captured.emit(key)
+                # self.pynput_listener.stop() # Stop after one key, will be called by stop_listener
+                self._is_running = False # Signal to stop the listener from outside or after emitting
+                return False # Stops the pynput listener
+
+            # Create and start the listener directly
+            # The listener itself runs in its own thread(s) created by pynput
+            self.pynput_listener = pynput_keyboard.Listener(on_press=on_press_callback)
+            print("[KeyListenerThread] Listener instance created.")
+            self.pynput_listener.start() # Start the listener
+            print("[KeyListenerThread] Listener started. Waiting for key or external stop.")
+
+            # Keep this QThread alive until is_running is set to False
+            # This allows the pynput listener's thread to do its work.
+            # The on_press_callback will set _is_running to False or stop_listener will.
+            while self._is_running:
+                self.msleep(50) # Sleep a bit to avoid busy waiting
+
+            print("[KeyListenerThread] Loop finished. Listener should be stopping/stopped.")
+
         except Exception as e:
-            # This might happen if another listener is already active from pynput,
-            # or due to threading issues on some platforms.
-            print(f"KeyListenerThread: Error starting listener: {e}")
+            print(f"[KeyListenerThread] EXCEPTION in listener thread: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             self.key_captured.emit(None) # Signal an error or no key
+        finally:
+            if self.pynput_listener:
+                print("[KeyListenerThread] Ensuring pynput listener is stopped in finally block.")
+                self.pynput_listener.stop() # Ensure it's stopped
+                # self.pynput_listener.join() # Wait for listener thread to actually finish
+            self.pynput_listener = None
+            self._is_running = False
+            print("[KeyListenerThread] Thread finished")
 
     def stop_listener(self):
-        self._stop_event = True
-        if self.listener:
-            # pynput listener stop can be a bit tricky from another thread
-            # It's often better to let it stop itself via `return False` in callback
-            try:
-                self.listener.stop()
-            except Exception as e:
-                print(f"Error stopping listener: {e}")
+        print("[KeyListenerThread] stop_listener() called externally.")
+        self._is_running = False # Signal the run loop to terminate
+        if self.pynput_listener:
+            print("[KeyListenerThread] Requesting pynput_listener to stop.")
+            self.pynput_listener.stop() # Request pynput listener to stop
 
 
 class AddKeyDialog(QDialog):
@@ -199,14 +217,18 @@ class AddKeyDialog(QDialog):
         self.accept() # Close the dialog
 
     def done(self, result):
-        # Ensure listener thread is stopped if dialog is closed prematurely
+        # Ensure listener thread is stopped and joined if dialog is closed/accepted/rejected
+        print(f"[AddKeyDialog] done() called with result: {result}")
         if self.key_listener_thread and self.key_listener_thread.isRunning():
-            print("Dialog closed, stopping listener thread...")
-            self.key_listener_thread.stop_listener() # Request stop
-            self.key_listener_thread.wait(1000) # Wait a bit for it to finish
+            print("[AddKeyDialog] Dialog closing, ensuring listener thread is stopped.")
+            self.key_listener_thread.stop_listener() # Signal the thread to stop its loop and the pynput listener
+            if not self.key_listener_thread.wait(1000): # Wait up to 1 sec
+                print("[AddKeyDialog] Warning: KeyListenerThread did not finish in time.")
+            else:
+                print("[AddKeyDialog] KeyListenerThread finished.")
         super().done(result)
 
-    # Allow dialog to be closed with Escape key, even if a listener is active (might be tricky)
+    # Allow dialog to be closed with Escape key
     # def keyPressEvent(self, event):
     #     if event.key() == Qt.Key.Key_Escape:
     #         self.reject()
