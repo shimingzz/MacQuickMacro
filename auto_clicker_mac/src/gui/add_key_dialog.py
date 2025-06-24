@@ -14,41 +14,53 @@ class KeyListenerThread(QThread):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.listener = None
-        self._stop_event = False
+        # self._stop_event = False # No longer explicitly used with 'with' statement logic
 
     def run(self):
-        self._stop_event = False
-        def on_press(key):
-            # Stop listening after the first key press
-            self.key_captured.emit(key)
-            return False # Stops the listener
-
-        # Create and start the listener in this thread
-        # self.listener = pynput_keyboard.Listener(on_press=on_press, suppress=True) # Suppress might be too aggressive
-        self.listener = pynput_keyboard.Listener(on_press=on_press)
-
-        # A small hack to ensure the listener runs correctly when started from a non-main thread
-        # or in environments where it might not pick up global events immediately.
-        # This is more relevant on some platforms/setups.
-        # For macOS, direct start should usually work if permissions are set.
+        print("[KeyListenerThread] Thread started")
         try:
-            self.listener.start()
-            self.listener.join() # Wait until listener stops (after one key)
-        except Exception as e:
-            # This might happen if another listener is already active from pynput,
-            # or due to threading issues on some platforms.
-            print(f"KeyListenerThread: Error starting listener: {e}")
-            self.key_captured.emit(None) # Signal an error or no key
+            def on_press(key):
+                print(f"[KeyListenerThread] Key pressed: {key}")
+                # Important: Emit the signal before trying to stop or join,
+                # as stopping might terminate the thread context for the signal.
+                self.key_captured.emit(key)
+                return False # Stops the listener
 
-    def stop_listener(self):
-        self._stop_event = True
-        if self.listener:
-            # pynput listener stop can be a bit tricky from another thread
-            # It's often better to let it stop itself via `return False` in callback
+            # Using 'with' statement for robust listener management
+            with pynput_keyboard.Listener(on_press=on_press) as listener_instance:
+                self.listener = listener_instance # Assign to self.listener if needed elsewhere, though 'with' manages it
+                print("[KeyListenerThread] Listener created and started")
+                self.listener.join() # Wait until listener stops (on_press returns False)
+
+            print("[KeyListenerThread] Listener stopped and joined")
+
+        except Exception as e:
+            print(f"[KeyListenerThread] EXCEPTION in listener thread: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            self.key_captured.emit(None) # Signal an error or no key
+        finally:
+            # self.listener = None # Listener is already out of scope or stopped
+            print("[KeyListenerThread] Thread finished")
+
+
+    def stop_listener(self): # This might be less critical if 'with' handles cleanup well
+        print("[KeyListenerThread] stop_listener called (External request)")
+        if self.listener and self.listener.is_alive(): # Check if listener is running
             try:
-                self.listener.stop()
+                print("[KeyListenerThread] Attempting to stop listener via internal stop method...")
+                # For pynput, returning False from callback is the primary way to stop.
+                # Direct self.listener.stop() can be problematic if called from a different thread
+                # than the one running the listener, or if the listener is not fully initialized.
+                # If the 'with' statement is used, this external stop might interfere or be redundant.
+                # Consider if this method is truly needed or if relying on callback return is sufficient.
+                # For now, we can try to call its stop method, but be cautious.
+                self.listener.stop() # This can still be problematic.
+                print("[KeyListenerThread] Listener explicitly stopped by stop_listener()")
             except Exception as e:
-                print(f"Error stopping listener: {e}")
+                print(f"[KeyListenerThread] Error stopping listener in stop_listener(): {e}")
+        else:
+            print("[KeyListenerThread] stop_listener: Listener was None or not alive.")
 
 
 class AddKeyDialog(QDialog):
